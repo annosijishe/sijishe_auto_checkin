@@ -1,20 +1,61 @@
 use anyhow::{Context, Result, anyhow};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{Shell, generate};
 use rand::{
     SeedableRng,
     distr::{Alphabetic, Distribution},
     rng,
     rngs::SmallRng,
 };
+use regex::Regex;
 use reqwest::Client;
 use scraper::{Html, Selector};
 use serde::Deserialize;
 use std::fs;
+use std::io;
 use tokio_retry::{
     Retry,
     strategy::{ExponentialBackoff, jitter},
 };
 
 const MAIN_URL: &str = "https://xsijishe.net";
+
+#[derive(Parser)]
+#[command(name = "sijishe")]
+#[command(about = "Sijishe CLI", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Check in
+    Checkin {
+        /// Optional regex to filter account username
+        #[arg(short, long)]
+        filter: Option<String>,
+    },
+    /// Buy a thread
+    Buy {
+        /// Thread ID
+        tid: String,
+
+        /// Optional regex to filter account username
+        #[arg(short, long)]
+        filter: Option<String>,
+
+        /// No confirm
+        #[arg(short, long)]
+        yes: bool,
+    },
+    /// Generate shell completion scripts
+    Completion {
+        /// Shell to generate completion script for
+        #[arg(value_enum)]
+        shell: Shell,
+    },
+}
 
 #[derive(Deserialize, Debug)]
 struct Account {
@@ -34,8 +75,43 @@ struct CheckInParams {
     referer: String,
 }
 
+fn filter_accounts(accounts: Vec<Account>, filter: &Option<String>) -> Result<Vec<Account>> {
+    let re = match filter {
+        Some(f) => Some(Regex::new(f).context("Invalid regex for filter")?),
+        None => None,
+    };
+
+    let filtered: Vec<Account> = accounts
+        .into_iter()
+        .filter(|a| {
+            if let Some(ref r) = re {
+                r.is_match(&a.username)
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    let usernames: Vec<&str> = filtered.iter().map(|a| a.username.as_str()).collect();
+    println!(
+        "👥 Accounts to process after filtering: {}",
+        usernames.join(", ")
+    );
+
+    Ok(filtered)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    if let Commands::Completion { shell } = cli.command {
+        let mut cmd = Cli::command();
+        let name = cmd.get_name().to_string();
+        generate(shell, &mut cmd, name, &mut io::stdout());
+        return Ok(());
+    }
+
     let config_dir = dirs::config_dir()
         .expect("config dir should be known on the platform")
         .join("sijishe");
@@ -54,43 +130,88 @@ async fn main() -> Result<()> {
 
     println!("⚙️ Config loaded from {}", config_path.display());
 
-    for account in accounts.iter() {
-        println!("========================================");
-        println!("🚀 Starting check-in for user: {}", account.username);
+    match cli.command {
+        Commands::Checkin { filter } => {
+            let accounts = filter_accounts(accounts, &filter)?;
+            for account in accounts.iter() {
+                println!("========================================");
+                println!("🚀 Starting check-in for user: {}", account.username);
 
-        match process_account(account).await {
-            Ok(_) => println!("✅ Finished processing for {}", account.username),
-            Err(e) => eprintln!("❌ Error processing {}: {:?}", account.username, e),
+                match process_account_checkin(account).await {
+                    Ok(_) => println!("✅ Finished processing for {}", account.username),
+                    Err(e) => eprintln!("❌ Error processing {}: {:?}", account.username, e),
+                }
+            }
         }
+        Commands::Buy { tid, filter, yes } => {
+            let accounts = filter_accounts(accounts, &filter)?;
+            for account in accounts.iter() {
+                println!("========================================");
+                println!("🚀 Starting buy for user: {}", account.username);
+
+                if !yes {
+                    use std::io::Write;
+                    print!(
+                        "Are you sure to buy thread {} for {}? [y/N] ",
+                        tid, account.username
+                    );
+                    io::stdout().flush()?;
+                    let mut input = String::new();
+                    io::stdin().read_line(&mut input)?;
+                    if input.trim().to_lowercase() != "y" {
+                        println!("Skipped.");
+                        continue;
+                    }
+                }
+
+                match process_account_buy(account, &tid).await {
+                    Ok(_) => println!("✅ Finished processing for {}", account.username),
+                    Err(e) => eprintln!("❌ Error processing {}: {:?}", account.username, e),
+                }
+            }
+        }
+        _ => {}
     }
 
     Ok(())
 }
 
-async fn process_account(account: &Account) -> Result<()> {
-    // Create a reqwest client with cookie store enabled
-    let client = Client::builder()
+async fn get_client() -> Result<Client> {
+    Client::builder()
         .cookie_store(true)
         .referer(false)
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/114.0 Safari/537.36")
-        .build()?;
+        .build()
+        .context("Failed to build client")
+}
 
-    // 1. Get login parameters
+async fn process_account_checkin(account: &Account) -> Result<()> {
+    let client = get_client().await?;
+
     let params = get_login_params(&client).await?;
     println!("📝 Fetched login params: formhash={}", params.formhash);
 
-    // 2. Login
     login(&client, account, &params).await?;
 
-    // 3. Get check-in parameters
     let params = get_check_in_params(&client).await?;
     println!("📝 Fetched check-in params: href={}", params.href);
 
-    // 4. Do Check-in
     do_check_in(&client, &params).await?;
 
-    // 5. Print User Info
     print_user_info(&client).await?;
+
+    Ok(())
+}
+
+async fn process_account_buy(account: &Account, tid: &str) -> Result<()> {
+    let client = get_client().await?;
+
+    let params = get_login_params(&client).await?;
+    println!("📝 Fetched login params: formhash={}", params.formhash);
+
+    login(&client, account, &params).await?;
+
+    buy(&client, tid).await?;
 
     Ok(())
 }
