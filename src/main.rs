@@ -388,11 +388,17 @@ async fn buy(client: &Client, tid: &str) -> Result<()> {
     println!("👀 Fetching thread info: {} ...", tid);
 
     let refer = format!("{}/thread-{}-1-1.html", MAIN_URL, tid);
-    client
+
+    let html = client
         .get(&refer)
         .header(reqwest::header::REFERER, format!("{}/", MAIN_URL))
         .send()
+        .await?
+        .text()
         .await?;
+    if parse_bought(&html) {
+        return Ok(());
+    }
 
     let buy_page_url = format!(
         "{}/jnpar_pansell-pay.html?tid={}&pid=&infloat=yes&handlekey=jnpar_pay_win1&inajax=1&ajaxtarget=fwin_content_jnpar_pay_win1",
@@ -448,10 +454,14 @@ async fn buy(client: &Client, tid: &str) -> Result<()> {
         .form(&payload)
         .send()
         .await?;
-    let redirected_url = resp.url();
+    let redirected_url = resp.url().to_string();
+    let html = resp.text().await?;
 
-    if redirected_url.to_string() == refer {
+    if redirected_url == refer {
         println!("✅ Buy thread {} successfully", tid);
+        if !parse_bought(&html) {
+            return Err(anyhow!("Failed to get bought info {}", tid));
+        }
     } else {
         return Err(anyhow!(
             "Failed to buy thread {}: reward not enough or bought before",
@@ -460,6 +470,38 @@ async fn buy(client: &Client, tid: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Return true if bought before
+fn parse_bought(html: &str) -> bool {
+    let html = Html::parse_document(html);
+    let subject = html
+        .select(&Selector::parse("span[id='thread_subject']").unwrap())
+        .next()
+        .map(|el| el.inner_html())
+        .unwrap_or("Unknown".to_string());
+    println!("🍌 Parsing subject: {}", subject);
+    if let Some(el) = html
+        .select(&Selector::parse("div[class='jnpar-pansell-links']").unwrap())
+        .next()
+    {
+        if el.inner_html().contains("购买后可查看") {
+            return false;
+        }
+        println!("✅ Already bought thread {}", subject);
+        let res = el
+            .select(&Selector::parse("span[class='jnpar-link-text']").unwrap())
+            .map(|el| el.inner_html())
+            .fold("".to_string(), |acc, x| {
+                format!(
+                    "{acc}  {}\n",
+                    x.trim_matches(|c| ['【', '】', '\n'].contains(&c))
+                )
+            });
+        println!("✈️ Info:\n{res}");
+        return true;
+    }
+    false
 }
 
 fn get_random_string(len: usize) -> String {
